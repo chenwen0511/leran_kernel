@@ -508,3 +508,149 @@ C[row * N + col] = value;
 - 保持了 Python 接口稳定，仅替换内核实现完成迭代
 
 这已经是走向高性能算子开发的关键里程碑。下一步最自然的方向是：`double buffering`、`vectorized load`、`wmma/tensor core`。
+
+## 24. Tensor Cores（WMMA）阶段实战复盘
+
+你已经成功完成 WMMA 雏形算子的编译与运行，终端结果如下：
+
+- `你的 Tensor Cores (WMMA) 版耗时: 0.0303 秒`
+- `PyTorch 官方 (cuBLAS) 耗时: 0.0828 秒`
+
+这说明当前 WMMA 扩展链路已经打通：`Python -> PyTorch Extension -> CUDA WMMA Kernel -> Tensor Cores`。
+
+## 25. WMMA 阶段遇到的关键报错与修复
+
+### 25.1 编译时报 `wmma::` 无法识别
+
+报错特征：
+
+- `name followed by "::" must be a class or namespace name`
+- 多处出现在 `wmma::fragment / load_matrix_sync / mma_sync / store_matrix_sync`
+
+根因：
+
+- 代码中使用了 `using namespace nvidia;`
+- WMMA 实际命名空间是 `nvcuda::wmma`
+
+修复：
+
+- 改为 `using namespace nvcuda;`
+
+### 25.2 Python 导入时报 `.so undefined symbol`
+
+报错特征：
+
+- `undefined symbol: TensorBase::data_ptr<__half>()`
+
+根因：
+
+- 扩展中直接调用 `A.data_ptr<half>()`
+- `half` 是 CUDA 的 `__half`，与 PyTorch C++ API 的模板实例符号不一致，导致运行时链接失败
+
+修复：
+
+- 使用 PyTorch 类型取指针，再转换为 CUDA half：
+  - `A.data_ptr<at::Half>()`
+  - `B.data_ptr<at::Half>()`
+  - `reinterpret_cast<const half*>(...)`
+
+这样能同时满足 PyTorch ABI 与 WMMA kernel 的参数类型要求。
+
+## 26. 新增代码详解：`matmul_wmma_pt.cu`
+
+### 26.1 头文件与命名空间
+
+核心依赖：
+
+- `#include <mma.h>`：WMMA API
+- `#include <cuda_fp16.h>`：`half` 类型
+
+命名空间：
+
+- `nvcuda::wmma` 才是正确入口
+
+### 26.2 WMMA tile 维度
+
+```cpp
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+```
+
+含义：
+
+- 每次 `mma_sync` 计算一个 `16x16x16` 的矩阵乘加块
+- 这是 Tensor Core 常见、硬件友好的基础粒度
+
+### 26.3 Fragment（片段）模型
+
+```cpp
+wmma::fragment<wmma::matrix_a, ...> a_frag;
+wmma::fragment<wmma::matrix_b, ...> b_frag;
+wmma::fragment<wmma::accumulator, ..., float> acc_frag;
+```
+
+理解重点：
+
+- fragment 不是普通数组，而是 Warp 级协作数据结构
+- `accumulator` 用 `float`，实现 FP16 输入、FP32 累加，减少数值误差
+
+### 26.4 核心计算流程
+
+每轮 `t` 循环做三件事：
+
+1. `wmma::load_matrix_sync` 加载 A/B tile 到 fragment
+2. `wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag)` 在 Tensor Cores 上做乘加
+3. 循环结束后 `wmma::store_matrix_sync` 写回 C
+
+本质是：沿 K 维分块，逐块累加。
+
+### 26.5 类型桥接（最关键修复点）
+
+现在的调用方式：
+
+```cpp
+reinterpret_cast<const half*>(A.data_ptr<at::Half>())
+reinterpret_cast<const half*>(B.data_ptr<at::Half>())
+```
+
+为什么正确：
+
+- `data_ptr<at::Half>()` 保证走 PyTorch 已导出的 ABI
+- `reinterpret_cast` 让 kernel 参数匹配 CUDA `half*`
+
+这是解决 `.so undefined symbol` 的关键。
+
+### 26.6 当前实现的工程特征
+
+当前 WMMA kernel 是“教学雏形”：
+
+- 逻辑清晰，便于理解 WMMA API
+- 线程组织仍较朴素（`16x16` block，资源利用未最优化）
+- 已具备进一步优化基础（warp mapping、多 warp/block、shared staging 等）
+
+## 27. 新增代码详解：`test_tensor_cores.py`
+
+脚本关键点：
+
+1. 输入强制使用 `torch.float16`（WMMA 前提）
+2. 先预热一次，避免首次执行开销污染
+3. 计时前后用 `torch.cuda.synchronize()`，确保异步 CUDA 计时准确
+4. 用 `torch.matmul` 作为 cuBLAS 对照组
+5. 将 `torch.matmul` 结果转为 FP32（与自定义输出精度对齐）
+
+当前脚本主要做性能对比；如果要更稳健，建议补充：
+
+- `torch.allclose(C_custom, C_pt, atol=...)` 正确性校验
+- 多轮统计（mean / p50 / p90）
+
+## 28. WMMA 阶段学习收获
+
+你已经掌握了 Tensor Core 路线的核心入口能力：
+
+- 会写并编译 WMMA 基础 kernel
+- 理解 fragment / load / mma / store 的计算流水
+- 能定位并修复 C++ 扩展常见 ABI/符号问题
+- 能把 FP16 输入 + FP32 累加接入 PyTorch 调用链
+
+这一步是从“shared memory 优化”走向“硬件专用计算单元优化”的关键跨越。

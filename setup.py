@@ -11,7 +11,7 @@ setup(
         #     'matmul_pt.cu', # 指向新写的文件
         # ]),
         CUDAExtension('custom_matmul', [
-            'matmul_shared_pt.cu', # 指向新写的文件
+            'matmul_wmma_pt.cu', # 指向新写的文件
         ])
     ],
     cmdclass={
