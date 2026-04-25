@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build artifacts (Python/CUDA extensions)
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# Local environment and tooling
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db

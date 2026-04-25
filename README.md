@@ -357,3 +357,154 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - 从“只看正确性”升级到“正确性 + 性能基准”双验证
 
 下一步如果继续优化 MatMul，最优先就是引入 **Shared Memory Tiling**，这是从“能跑”走向“能快”的第一道门槛。
+
+## 20. 共享内存优化（Shared Memory）实战复盘
+
+你已经完成了下一阶段：把 Naive MatMul 升级为 Shared Memory Tiling 版本，并成功跑通测试。
+
+终端输出显示：
+
+- `你的 Shared Memory 版耗时: 0.0207 秒`
+- `PyTorch 官方 (cuBLAS) 耗时: 0.0343 秒`
+
+这说明共享内存版本已经正确执行且性能有明显提升。  
+由于单次计时受系统状态、GPU 动态频率、首次调用路径和样本次数影响，建议用多次迭代取平均值做最终结论（下文会给建议）。
+
+## 21. 新增代码原理详解：`matmul_shared_pt.cu`
+
+### 21.1 为什么 Shared Memory 能加速
+
+Naive 版本的问题是：每个线程都从全局显存反复读取 A/B 元素，访存延迟高。  
+Shared Memory 版本把计算拆成 `16x16` 的小块（tile）：
+
+1. 先把 tile 从全局显存搬到共享内存
+2. 块内线程同步后，在共享内存中做乘加
+3. 重复滑动 tile，累计结果
+
+核心收益是“数据复用”：同一块数据在共享内存中可被多个线程重复使用，显著减少全局显存访问。
+
+### 21.2 关键结构一：`TILE_SIZE = 16`
+
+```cpp
+#define TILE_SIZE 16
+```
+
+含义：
+
+- 每个线程块尺寸是 `16 x 16 = 256` 个线程
+- 每次处理输出矩阵的一个 `16x16` 子块
+- `256` 是常见、稳定的线程块规模，通常能较好兼顾并行度和资源占用
+
+### 21.3 关键结构二：共享内存 tile
+
+```cpp
+__shared__ float sA[TILE_SIZE][TILE_SIZE];
+__shared__ float sB[TILE_SIZE][TILE_SIZE];
+```
+
+含义：
+
+- `sA`/`sB` 是 block 级共享缓存
+- 一个 block 内所有线程可读写同一份 tile
+- 这是“团队搬运 + 团队计算”的数据中心
+
+### 21.4 关键结构三：全局坐标与线程职责
+
+```cpp
+int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+```
+
+每个线程只负责输出矩阵 `C[row, col]` 的一个元素；  
+但这个元素需要跨越整个 `K` 维做点积，所以会在 `t` 循环里不断累加。
+
+### 21.5 关键结构四：沿 K 维分块滑动（Tiling Loop）
+
+```cpp
+int numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+for (int t = 0; t < numTiles; ++t) { ... }
+```
+
+本质是把长点积拆成多个短点积，每次只处理一个 tile 宽度。  
+这个“滑窗”过程是 GPU MatMul 优化最核心的思想之一。
+
+### 21.6 关键结构五：协同加载 + 越界补零
+
+```cpp
+if (row < M && t * TILE_SIZE + threadIdx.x < K) {
+    sA[threadIdx.y][threadIdx.x] = A[row * K + t * TILE_SIZE + threadIdx.x];
+} else {
+    sA[threadIdx.y][threadIdx.x] = 0.0f;
+}
+```
+
+`B` 的加载逻辑同理。  
+意义：
+
+- 让 tile 边界外的线程写入 `0`，避免非法访存
+- 保持计算逻辑统一，不需要为尾块写复杂分支
+
+### 21.7 关键结构六：两次 `__syncthreads()` 的必要性
+
+第一次同步（加载后）：
+
+- 确保所有线程都完成了 `sA/sB` 的写入
+- 否则有线程可能读到未写完的数据
+
+第二次同步（计算后）：
+
+- 确保所有线程都用完当前 tile
+- 才能安全进入下一轮并覆盖共享内存
+
+这两个同步点是正确性关键，少一个都可能导致随机错误结果。
+
+### 21.8 关键结构七：寄存器累加与最终写回
+
+```cpp
+float value = 0.0f;
+...
+value += sA[threadIdx.y][i] * sB[i][threadIdx.x];
+...
+C[row * N + col] = value;
+```
+
+每个线程在寄存器中维护私有累加器 `value`，最后一次性写回全局显存。  
+这减少了中间结果的显存往返开销。
+
+### 21.9 PyTorch 接口层保持稳定
+
+`matmul_forward` 与 Naive 版本接口语义一致：
+
+- 检查 `CUDA + contiguous + 维度匹配`
+- 分配输出 `C`
+- 配置 `dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE)`
+- 启动 `matmul_shared_kernel`
+
+这意味着你只替换了“内核实现”，而没有破坏 Python 调用方式。
+
+## 22. 测速脚本解读：`test_speed.py`
+
+`test_speed.py` 目标是快速比较 Shared 版本与 `torch.matmul`：
+
+1. 构造 `4096x4096` 输入
+2. 预热一次自定义算子
+3. 用 `torch.cuda.synchronize()` 包裹计时
+4. 打印两者耗时
+
+这能快速观察趋势，但若要更严谨，建议：
+
+- 两边都预热多次（如 10 次）
+- 正式测量多次（如 50~100 次）取均值和 P50/P90
+- 保证同一进程、同一功耗状态下测试
+- 增加正确性校验：`torch.allclose(C_custom, C_pt, atol=1e-3)`
+
+## 23. 这一阶段你真正掌握了什么
+
+你已经从“会写 CUDA 算子”升级到“会做第一层性能优化”：
+
+- 理解并实现了 Tiling + Shared Memory
+- 掌握了 `__syncthreads()` 在并行协作中的语义
+- 知道了“正确性、性能、可复现基准”三者要同时看
+- 保持了 Python 接口稳定，仅替换内核实现完成迭代
+
+这已经是走向高性能算子开发的关键里程碑。下一步最自然的方向是：`double buffering`、`vectorized load`、`wmma/tensor core`。

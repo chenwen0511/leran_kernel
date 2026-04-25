@@ -7,8 +7,11 @@ setup(
         CUDAExtension('custom_ops', [
             'vector_add_pt.cu', # 你的源文件
         ]),
+        # CUDAExtension('custom_matmul', [
+        #     'matmul_pt.cu', # 指向新写的文件
+        # ]),
         CUDAExtension('custom_matmul', [
-            'matmul_pt.cu', # 指向新写的文件
+            'matmul_shared_pt.cu', # 指向新写的文件
         ])
     ],
     cmdclass={
