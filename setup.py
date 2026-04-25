@@ -1,0 +1,14 @@
+from setuptools import setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+setup(
+    name='custom_ops', # 这是你未来在 Python 里 import 的包名
+    ext_modules=[
+        CUDAExtension('custom_ops', [
+            'vector_add_pt.cu', # 你的源文件
+        ])
+    ],
+    cmdclass={
+        'build_ext': BuildExtension
+    }
+)
