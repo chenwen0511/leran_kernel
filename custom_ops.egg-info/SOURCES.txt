@@ -1,7 +1,0 @@
-README.md
-setup.py
-vector_add_pt.cu
-custom_ops.egg-info/PKG-INFO
-custom_ops.egg-info/SOURCES.txt
-custom_ops.egg-info/dependency_links.txt
-custom_ops.egg-info/top_level.txt
