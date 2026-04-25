@@ -254,3 +254,106 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - PyTorch C++/CUDA 扩展 `custom_ops` 成功编译并安装
 - Python 端调用 `custom_ops.forward` 成功且结果正确
 - 环境版本一致性（`torch cu128` + `nvcc 12.8`）已固定到 `jax_env`
+
+## 14. 第三步（Naive MatMul）学习过程复盘
+
+你在第三步已经完成了“二维 CUDA Kernel + PyTorch 绑定 + 性能/精度对比测试”的完整闭环。
+
+终端实测结果：
+
+- 输入规模：`A(4096x4096)`、`B(4096x4096)`
+- 朴素 CUDA 算子：`0.0270 s`
+- PyTorch 官方（cuBLAS）：`0.0026 s`
+- 正确性：`True`
+
+这说明两件事都成立：
+
+1. 算法实现是正确的（数值与 `torch.matmul` 对齐）
+2. 性能仍有巨大优化空间（当前约慢一个数量级）
+
+## 15. 新增代码解读：`matmul_pt.cu`
+
+### 15.1 二维线程映射（核心升级点）
+
+相比向量加法的一维索引，矩阵乘法采用二维索引：
+
+- `row = blockIdx.y * blockDim.y + threadIdx.y`
+- `col = blockIdx.x * blockDim.x + threadIdx.x`
+
+含义是：每个线程负责输出矩阵 `C[row, col]` 的一个元素。  
+这一步是从 1D 并行模型升级到 2D 并行模型的关键。
+
+### 15.2 Kernel 计算逻辑（点积）
+
+在 `if (row < M && col < N)` 保护下，线程执行：
+
+- 初始化 `value = 0`
+- 遍历 `k in [0, K)`，累计
+  - `A[row * K + k] * B[k * N + col]`
+- 写回 `C[row * N + col] = value`
+
+这里显式展示了二维矩阵在显存中按一维地址访问（行主序展开）。
+
+### 15.3 PyTorch 接口层：`matmul_forward`
+
+`matmul_forward(torch::Tensor A, torch::Tensor B)` 里新增了三类保障：
+
+1. 设备与内存布局检查
+   - `A/B` 必须是 CUDA Tensor
+   - `A/B` 必须 `contiguous`
+2. 维度合法性检查
+   - `A.size(1) == B.size(0)`
+3. 输出分配与 kernel 启动
+   - `C = torch::empty({M, N}, A.options())`
+   - `threadsPerBlock(16, 16)`，总线程 256
+   - `blocksPerGrid` 采用向上取整，确保覆盖全部元素
+
+### 15.4 Python 绑定
+
+通过：
+
+- `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)`
+- `m.def("forward", &matmul_forward, ...)`
+
+把 C++/CUDA 入口导出为 Python 可调用接口 `custom_matmul.forward(...)`。
+
+## 16. 新增代码解读：`setup.py` 的变化
+
+你把扩展编译从“单算子”升级为“多算子同仓”：
+
+- 原有：`custom_ops <- vector_add_pt.cu`
+- 新增：`custom_matmul <- matmul_pt.cu`
+
+这意味着一次 `python setup.py install` 会同时构建两个 CUDA 扩展模块，后续实验管理更方便。
+
+## 17. 新增代码解读：`test_matmul.py`
+
+这个测试脚本设计得很标准，包含了性能测量的关键细节：
+
+1. 构造大矩阵并 `contiguous()`
+2. 先预热（避免首次调用包含初始化开销）
+3. 用 `torch.cuda.synchronize()` 包裹计时区间，保证计时准确
+4. 与 `torch.matmul`（底层 cuBLAS）同输入对比
+5. 用 `torch.allclose(..., atol=1e-3)` 做浮点容差验证
+
+这份脚本既是功能测试，也是基准测试（baseline benchmark）。
+
+## 18. 为什么正确但比 cuBLAS 慢
+
+当前 `matmul_kernel` 是“朴素全局内存版本”：
+
+- 每个线程在 `K` 循环中频繁访问全局显存
+- 没有使用 shared memory 做 tile 复用
+- 没有做寄存器/访存合并/向量化等优化
+
+而 cuBLAS 会做高度工程化优化（分块、共享内存、流水线、指令级并行等），所以大幅更快是预期结果，不是代码错误。
+
+## 19. 第三步学习收获总结
+
+通过这一步，你已经掌握了大模型算子开发中非常关键的工程能力：
+
+- 从一维并行思维升级到二维线程映射
+- 从“写 Kernel”升级到“写可被 PyTorch 调用的扩展”
+- 从“只看正确性”升级到“正确性 + 性能基准”双验证
+
+下一步如果继续优化 MatMul，最优先就是引入 **Shared Memory Tiling**，这是从“能跑”走向“能快”的第一道门槛。
