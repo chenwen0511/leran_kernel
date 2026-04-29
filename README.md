@@ -254,6 +254,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - PyTorch C++/CUDA 扩展 `custom_ops` 成功编译并安装
 - Python 端调用 `custom_ops.forward` 成功且结果正确
 - 环境版本一致性（`torch cu128` + `nvcc 12.8`）已固定到 `jax_env`
+- `test_flash.py`：长序列下标准 Attention 与 `scaled_dot_product_attention`（Flash/融合后端）的耗时与 `allclose` 对比（见第 29 节）
 
 ## 14. 第三步（Naive MatMul）学习过程复盘
 
@@ -654,3 +655,94 @@ reinterpret_cast<const half*>(B.data_ptr<at::Half>())
 - 能把 FP16 输入 + FP32 累加接入 PyTorch 调用链
 
 这一步是从“shared memory 优化”走向“硬件专用计算单元优化”的关键跨越。
+
+## 29. FlashAttention 对比实验（`test_flash.py`）
+
+### 29.1 为什么需要对比
+
+自注意力是 Transformer 的核心，朴素实现会先显式构造 **注意力分数矩阵** \(S = QK^\top / \sqrt{d}\)，再 `softmax`，再与 \(V\) 相乘。当序列长度 \(L\) 很大时，\(S\) 的形状约为 `(batch, heads, L, L)`，**显存与 HBM 访问量都按 \(O(L^2)\) 增长**，容易成为瓶颈。
+
+**FlashAttention**（及其在 PyTorch 中的融合实现）通过 **分块（tiling）、在 SRAM 上融合 softmax 与对 \(V\) 的加权、以及逆向传播时的重计算** 等策略，显著减少对全局显存（HBM）的往返次数，因此在长序列、大 head 数配置下往往比“先算满矩阵再 softmax”的朴素路径快得多。
+
+本仓库中的 `test_flash.py` 在同一组随机 \(Q,K,V\) 上，分别测量：
+
+1. **标准路径**：手写 `matmul → softmax → matmul`（会产生完整 \(L\times L\) 中间结果）。
+2. **融合路径**：`torch.nn.functional.scaled_dot_product_attention`（在支持的 GPU + dtype + 形状下会走 **FlashAttention / Memory-Efficient** 等后端）。
+
+实测示例（RTX 4090，环境因驱动与 PyTorch 版本略有浮动）：
+
+- 标准 Attention：约 **120 ms**
+- FlashAttention（融合 API）：约 **14 ms**
+- 数值：`torch.allclose(..., atol=1e-2)` 为 **True**
+
+结论：**正确性可对齐的前提下，长序列下融合实现能带来数量级量级的加速**，主要来自访存与算子融合，而非“公式变了”。
+
+### 29.2 脚本在算什么（形状与语义）
+
+脚本开头设定：
+
+- `batch = 1`，`heads = 32`，`seq_len = 8192`，`head_dim = 128`
+- \(Q, K, V\) 均为 GPU 上的 **`float16`** 张量，形状 `(batch, heads, seq_len, head_dim)`。
+
+这与常见多头注意力一致：每个 head 独立做 scaled dot-product attention，最后在 head 维上已由张量布局隐含（未做显式 `concat`，但计算等价于对每 head 各算一次再加权合并前的中间形态；此处输出形状仍为 `(1, 32, 8192, 128)`，用于和 baseline 对比）。
+
+### 29.3 标准实现：`standard_attention`
+
+逻辑与教科书定义一致：
+
+1. `scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(head_dim)`  
+   得到 logits，最后一维长度为 `seq_len`，对每个 query 位置对应一整行与所有 key 的点积。
+2. `probs = softmax(scores, dim=-1)`  
+   得到注意力权重。
+3. `output = torch.matmul(probs, v)`  
+   对价值向量加权求和。
+
+该路径会 **物化较大的中间张量**（尤其是 `scores` / softmax 前的临时缓冲），HBM 读写量大；\(L=8192\) 时平方级中间规模非常明显。
+
+### 29.4 FlashAttention 路径：`scaled_dot_product_attention`
+
+```python
+out_flash = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+```
+
+在 **PyTorch 2.x** 中，该 API 会根据设备能力、数据类型、形状等选择实现（可能包括 **FlashAttention**、**Memory-Efficient Attention** 或 **Math** 回退）。若实际走了优化后端，则内部会以 **块为单位** 在更靠近计算单元的存储层级完成 softmax 与对 \(V\) 的乘加，避免写出完整的 \(L\times L\) 矩阵到 HBM，从而降低延迟与显存压力。
+
+**注意**：是否启用 Flash/高效内核取决于 PyTorch 构建选项、`sdp_kernel` 上下文、以及是否满足数值与对齐条件；若回退到纯数学实现，差距会缩小。本实验在 4090 + FP16 的典型配置下观察到的大幅提速，与“走融合内核”的预期一致。
+
+### 29.5 计时方式为什么要 `torch.cuda.synchronize()`
+
+CUDA kernel **异步** 提交：若只在 CPU 上 `time.time()` 而不同步，结束时间可能在 GPU 实际算完之前就读取，导致 **严重低估** 耗时。
+
+脚本在每次计时段落前后调用 `torch.cuda.synchronize()`，保证：
+
+- 计时区间内提交的 GPU 工作已全部完成；
+- 标准路径与 Flash 路径采用相同测量口径，结果可比。
+
+### 29.6 正确性：`torch.allclose`
+
+两种实现都会在浮点舍入上略有差异（尤其是 FP16 累加、softmax 的归一化路径不同）。脚本使用：
+
+```python
+torch.allclose(out_std, out_flash, atol=1e-2)
+```
+
+表示在 **绝对容差 1e-2** 下逐元素比较是否足够接近；若需更严，可改为更小 `atol`/`rtol` 或在高精度下比对 FP32 参考。教学与性能对比场景下，`1e-2` 常用于 FP16 端到端输出。
+
+### 29.7 如何运行
+
+```bash
+conda activate jax_env   # 或你已配置好的、含 PyTorch 2.x + CUDA 的环境
+python test_flash.py
+```
+
+依赖：`torch` 能使用 CUDA，且版本支持 `scaled_dot_product_attention`（建议 PyTorch 2.0+）。
+
+### 29.8 小结
+
+| 项目 | 标准 Attention | `scaled_dot_product_attention`（融合后端） |
+|------|----------------|--------------------------------------------|
+| 中间矩阵 | 显式 \(O(L^2)\) 量级物化 | 块计算，减少 HBM 往返 |
+| 典型长序列表现 | 较慢、显存压力大 | 往往显著更快 |
+| 本脚本作用 | 同输入对比耗时与 `allclose` | 验证“融合路径”带来的收益 |
+
+这一步的意义是：在 **不写 CUDA 内核** 的前提下，先建立对 **IO 感知注意力（FlashAttention 类思想）** 的直观认识，并与朴素三层算子链做 **可复现的数值与性能对照**，为后续阅读论文或自研内核打下基础。
