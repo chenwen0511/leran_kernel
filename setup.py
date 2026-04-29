@@ -12,6 +12,9 @@ setup(
         # ]),
         CUDAExtension('custom_matmul', [
             'matmul_wmma_pt.cu', # 指向新写的文件
+        ]),
+        CUDAExtension('toy_flash_attn', [
+            'toy_flash_attn.cu',
         ])
     ],
     cmdclass={

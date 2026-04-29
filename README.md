@@ -255,6 +255,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - Python 端调用 `custom_ops.forward` 成功且结果正确
 - 环境版本一致性（`torch cu128` + `nvcc 12.8`）已固定到 `jax_env`
 - `test_flash.py`：长序列下标准 Attention 与 `scaled_dot_product_attention`（Flash/融合后端）的耗时与 `allclose` 对比（见第 29 节）
+- `test_triton_flash.py`：单头、二维张量上的 Triton 版 FlashAttention（online softmax）与 PyTorch 朴素三层算子对比（见第 30 节）
 
 ## 14. 第三步（Naive MatMul）学习过程复盘
 
@@ -746,3 +747,72 @@ python test_flash.py
 | 本脚本作用 | 同输入对比耗时与 `allclose` | 验证“融合路径”带来的收益 |
 
 这一步的意义是：在 **不写 CUDA 内核** 的前提下，先建立对 **IO 感知注意力（FlashAttention 类思想）** 的直观认识，并与朴素三层算子链做 **可复现的数值与性能对照**，为后续阅读论文或自研内核打下基础。
+
+## 30. Triton FlashAttention 教学内核（`test_triton_flash.py`）
+
+### 30.1 脚本目的与实测现象
+
+`test_triton_flash.py` 用 **Triton** 手写一个 **单头**、**二维布局** 的缩放点积注意力核（`Q,K,V` 形状均为 `(seq_len, d)`），与 PyTorch 的 **朴素三步**（`matmul → softmax → matmul`）在同一设备、同一输入上对比 **耗时** 与 **`torch.allclose`**。
+
+一次典型终端输出（4090、`seq_len=4096`、`d=32`、FP16）：
+
+- PyTorch 标准 Attention：约 **89.66 ms**
+- Triton FlashAttention：约 **519.22 ms**
+- 正确性：`allclose(atol=1e-2, rtol=1e-2)` 为 **通过**
+
+这里会出现 **Triton 反而更慢** 的情况，属于基准测试中的常见“陷阱”，不代表“Flash 思想一定更快”。见下文 **30.5**。
+
+### 30.2 原理：Online Softmax 与块式 Flash
+
+论文中的 FlashAttention 核心是把 \(QK^\top\)、softmax 与对 \(V\) 的加权 **融合在分块遍历中**，避免对大矩阵 \(S\in\mathbb{R}^{L\times L}\) 做一次性物化，从而降低 HBM 流量。
+
+本脚本的 `flash_attn_kernel` 采用 **Online Softmax**（Streaming Softmax）经典递推：对每个 query 行维护_running max \(m_i\) 与归一化因子 \(l_i\)，在沿序列维滑动的每个 \(K,V\) 块上更新 \(m_{ij}\)、\(m_{\mathrm{new}}\)、\(l_{\mathrm{new}}\)，并对累加器 `acc` 做按行重标定（乘以 `alpha`），最后在寄存器里做 `acc / l_i` 得到输出。这样 **理论上** 不需要存完整 \(L\times L\) 的注意力 logits。
+
+实现上与教学注释一致的关键步骤：
+
+- 用 `pid = tl.program_id(0)` 划分 **query 行块**，`start_m = pid * BLOCK_M`
+- 外层沿 `start_n in range(0, seq_len, BLOCK_N)` 遍历 **key/value 列块**
+- `qk = tl.dot(q, tl.trans(k))` 做块内 \(Q K^\top\)，再除以 \(\sqrt{d}\)（脚本里对 \(d=32\) 写死为 `5.65685`）
+- Online softmax 更新：`m_ij`、`m_new`、`alpha`、`p`、`l_new`、`acc` 的 tensor 组合
+- 最后用 `tl.store` 写回 `O`
+
+### 30.3 代码结构导读
+
+| 部分 | 作用 |
+|------|------|
+| `@triton.jit` `flash_attn_kernel` | GPU kernel：块加载 `Q/K/V`，online softmax，写 `O` |
+| `BLOCK_M / BLOCK_N / BLOCK_D` | 编译期块大小（脚本中为 64/64/32，需与 `d` 一致） |
+| `grid = (triton.cdiv(seq_len, BLOCK_M),)` | 一维 grid，每个 program 负责一段 query 行 |
+| `triton_flash_attention` | Host 侧分配输出、`flash_attn_kernel[grid](...)` 启动 |
+| `__main__` | 构造随机 FP16 `Q,K,V`，先后计时节朴素 PyTorch 与 Triton，再 `allclose` |
+
+缩放因子脚本使用 **常量** `sqrt(32)`；若修改 `d`，需同步修改 kernel 中的除数（或改为传入 `scale` 指针/常量），否则数值会与 PyTorch 不一致。
+
+### 30.4 与 `test_flash.py` 的差异
+
+- **布局**：本脚本为 **单头、二维** `(L, d)`；`test_flash.py` 为 **多头四维** `(B, H, L, D)` 且对照 **PyTorch 融合 SDP**。
+- **对照组**：本脚本对照的是 **手写三层朴素实现**；朴素路径中的两次 `matmul` 在 PyTorch 后端通常走 **cuBLAS**，对中等 \(L\) 与 FP16 高度成熟，**峰值算力很高**。
+- **目的**：本脚本侧重 **用 Triton 表达 Flash 类递推并验证正确性**；性能需单独做 **预热、多轮取均值、profiling** 再下结论。
+
+### 30.5 为何本次计时会出现「Triton 更慢」
+
+下面几条往往叠加出现，**任意一条**都足以让单次计时里 Triton 看起来更慢：
+
+1. **JIT 编译开销**：`@triton.jit` 首次调用会 **即时编译**；若未先预热再计时段，**编译时间会计入** `time.time()` 区间，放大量化误差。
+2. **对照组过强**：朴素路径的两步 `matmul` 由 **cuBLAS** 高度优化；在 \(L=4096\) 这类规模上，大矩阵乘常常 **非常能打**，而教学用 Triton kernel 未必启用同等强度的调度与融合。
+3. **问题规模与块参数**：`BLOCK_M/N/D` 未 autotune、未针对该 \(L,d\) 调优时，占用率、访存模式可能_suboptimal。
+4. **内核复杂度**：本实现沿 \(N\) 维 Python `range` 循环调度多块，launch 与同步开销相对单次短 kernel 可能更明显（随 Triton 版本与 GPU 而变）。
+
+因此：**正确性 `allclose` 通过** 说明实现语义大致对齐；**单次 wall-clock 优劣** 不能直接推广为“Flash 一定快”，应增加 **预热重复运行**、**仅统计稳态 kernel 时间**（或 `torch.cuda.Event`），必要时再用 **NCU** 看瓶颈。
+
+### 30.6 如何运行
+
+```bash
+conda activate jax_env   # 需已安装 triton、torch CUDA 版
+python test_triton_flash.py
+```
+
+### 30.7 小结
+
+- 本文件展示：**用 Triton 描述 Flash 类 online softmax、块加载、`tl.dot` 计算 \(QK^\top\) 子块并与 \(V\) 融合累加** 的写法。
+- 与 PyTorch 朴素三步对比时，请 **先 warmup、再多轮测均值**，避免把 JIT 当成绩；并与 **融合 SDP**（`test_flash.py`）区分对照含义。
