@@ -1,10 +1,26 @@
 # CUDA Vector Add 排障记录（RTX 4090 + Ubuntu 22.04）
 
-本文记录 `vector_add.cu` 从“编译通过但运行失败”到“最终运行成功”的完整调试过程，方便后续复现和排错。
+本文记录裸 CUDA 向量加法从“编译通过但运行失败”到“最终运行成功”的完整调试过程，方便后续复现和排错。
+
+## 仓库目录结构（按学习阶段）
+
+| 目录 | 对应 README 章节 | 主要内容 |
+|------|------------------|----------|
+| `01_bare_cuda_vector_add/` | §1–§8 | 裸 CUDA：`vector_add.cu` |
+| `02_pytorch_extension_vector_add/` | §9–§13 | PyTorch 扩展：`vector_add_pt.cu`、`test.py` |
+| `03_matmul_naive/` | §14–§19 | 朴素 MatMul：`matmul_pt.cu`、`test_matmul.py` |
+| `04_matmul_shared_memory/` | §20–§23 | Shared Memory：`matmul_shared_pt.cu`、`test_speed.py` |
+| `05_matmul_wmma/` | §24–§28 | WMMA / Tensor Core：`matmul_wmma_pt.cu`、`test_tensor_cores.py` |
+| `06_flash_attention/` | §29 | PyTorch SDP / Flash 对比：`test_flash.py` |
+| `07_triton_flash_attention/` | §30 | Triton 教学内核：`test_triton_flash.py` |
+| `08_toy_flash_attention/` | （补充实验） | Toy Flash：`toy_flash_attn.cu`、`test_toy_flash.py` |
+| `notes/` | — | `gemini_steps1.md`、`gemini_steps2.md` |
+
+根目录保留 **`setup.py`**：在仓库根目录执行 `python setup.py install`（或 `pip install -e .`）会按路径编译上述各阶段的 `.cu` 扩展（当前 `custom_matmul` 指向 WMMA 版本，见 `setup.py` 内注释说明）。
 
 ## 1. 初始现象
 
-- 编译成功：`nvcc vector_add.cu -o vector_add`
+- 编译成功：`nvcc 01_bare_cuda_vector_add/vector_add.cu -o vector_add`
 - 运行失败：`./vector_add` 输出“算子执行失败”
 - 环境信息：
   - `nvidia-smi` 正常，GPU 为 `RTX 4090`
@@ -12,7 +28,7 @@
 
 ## 2. 第一次定位：给代码加 CUDA 错误检查
 
-在 `vector_add.cu` 中加入了：
+在 `01_bare_cuda_vector_add/vector_add.cu` 中加入了：
 
 - `CHECK_CUDA(...)` 宏，用于检查每个 CUDA API 的返回值
 - 在 kernel launch 后增加：
@@ -65,7 +81,7 @@ nvcc --version
 最后编译运行：
 
 ```bash
-nvcc -arch=sm_89 vector_add.cu -o vector_add
+nvcc -arch=sm_89 01_bare_cuda_vector_add/vector_add.cu -o vector_add
 ./vector_add
 ```
 
@@ -85,7 +101,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - Ada 架构（4090）编译时建议显式指定：`-arch=sm_89`
 - 新写 CUDA 程序时保留 `CHECK_CUDA` 和 `cudaDeviceSynchronize`，可显著缩短排障时间
 
-## 8. `vector_add.cu` 核心逻辑解读
+## 8. `01_bare_cuda_vector_add/vector_add.cu` 核心逻辑解读
 
 这份代码本质上是在演示 CUDA 程序的标准执行闭环：Host 准备数据 -> Device 并行计算 -> Host 验证结果。
 
@@ -184,7 +200,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 - 使用 `/usr/local/cuda-12.8/bin/nvcc` 编译
 - 正确生成并安装 `custom_ops` 动态库
 
-`python test.py` 输出：
+`python 02_pytorch_extension_vector_add/test.py` 输出：
 
 - `初始化 GPU Tensors...`
 - `调用自定义 CUDA 算子...`
@@ -193,7 +209,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 
 说明 PyTorch -> C++ Extension -> CUDA Kernel 的完整调用链已经跑通。
 
-## 10. 新增代码详解：`vector_add_pt.cu`
+## 10. 新增代码详解：`02_pytorch_extension_vector_add/vector_add_pt.cu`
 
 ### 10.1 Kernel 部分（与裸 CUDA 版本一致）
 
@@ -228,14 +244,14 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 
 `setup.py` 的作用是告诉 Python 如何构建你的 CUDA 扩展：
 
-- `CUDAExtension('custom_ops', ['vector_add_pt.cu'])`：定义扩展名和源文件
+- `CUDAExtension('custom_ops', ['02_pytorch_extension_vector_add/vector_add_pt.cu'])`：定义扩展名和源文件（路径以仓库根目录为准）
 - `BuildExtension`：调用 PyTorch 提供的构建流程（内部会调 nvcc/g++）
 
 当你执行 `python setup.py install` 时，本质是在编译并安装 `custom_ops*.so` 到当前环境 `site-packages`。
 
-## 12. 新增代码详解：`test.py`
+## 12. 新增代码详解：`02_pytorch_extension_vector_add/test.py`
 
-`test.py` 是最小功能验证脚本，分三步：
+`02_pytorch_extension_vector_add/test.py` 是最小功能验证脚本，分三步：
 
 1. 在 GPU 上构造输入 Tensor：
    - `a` 全 1
@@ -250,12 +266,12 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 
 ## 13. 本项目当前状态（已达成）
 
-- 裸 CUDA 程序 `vector_add.cu` 可在 4090 成功运行
+- 裸 CUDA 程序 `01_bare_cuda_vector_add/vector_add.cu` 可在 4090 成功运行
 - PyTorch C++/CUDA 扩展 `custom_ops` 成功编译并安装
 - Python 端调用 `custom_ops.forward` 成功且结果正确
 - 环境版本一致性（`torch cu128` + `nvcc 12.8`）已固定到 `jax_env`
-- `test_flash.py`：长序列下标准 Attention 与 `scaled_dot_product_attention`（Flash/融合后端）的耗时与 `allclose` 对比（见第 29 节）
-- `test_triton_flash.py`：单头、二维张量上的 Triton 版 FlashAttention（online softmax）与 PyTorch 朴素三层算子对比（见第 30 节）
+- `06_flash_attention/test_flash.py`：长序列下标准 Attention 与 `scaled_dot_product_attention`（Flash/融合后端）的耗时与 `allclose` 对比（见第 29 节）
+- `07_triton_flash_attention/test_triton_flash.py`：单头、二维张量上的 Triton 版 FlashAttention（online softmax）与 PyTorch 朴素三层算子对比（见第 30 节）
 
 ## 14. 第三步（Naive MatMul）学习过程复盘
 
@@ -273,7 +289,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 1. 算法实现是正确的（数值与 `torch.matmul` 对齐）
 2. 性能仍有巨大优化空间（当前约慢一个数量级）
 
-## 15. 新增代码解读：`matmul_pt.cu`
+## 15. 新增代码解读：`03_matmul_naive/matmul_pt.cu`
 
 ### 15.1 二维线程映射（核心升级点）
 
@@ -323,12 +339,12 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 
 你把扩展编译从“单算子”升级为“多算子同仓”：
 
-- 原有：`custom_ops <- vector_add_pt.cu`
-- 新增：`custom_matmul <- matmul_pt.cu`
+- 原有：`custom_ops <- 02_pytorch_extension_vector_add/vector_add_pt.cu`
+- 新增：`custom_matmul <- 03_matmul_naive/matmul_pt.cu`（或与后续 Shared / WMMA 版本切换，见根目录 `setup.py`）
 
 这意味着一次 `python setup.py install` 会同时构建两个 CUDA 扩展模块，后续实验管理更方便。
 
-## 17. 新增代码解读：`test_matmul.py`
+## 17. 新增代码解读：`03_matmul_naive/test_matmul.py`
 
 这个测试脚本设计得很标准，包含了性能测量的关键细节：
 
@@ -372,7 +388,7 @@ nvcc -arch=sm_89 vector_add.cu -o vector_add
 这说明共享内存版本已经正确执行且性能有明显提升。  
 由于单次计时受系统状态、GPU 动态频率、首次调用路径和样本次数影响，建议用多次迭代取平均值做最终结论（下文会给建议）。
 
-## 21. 新增代码原理详解：`matmul_shared_pt.cu`
+## 21. 新增代码原理详解：`04_matmul_shared_memory/matmul_shared_pt.cu`
 
 ### 21.1 为什么 Shared Memory 能加速
 
@@ -484,9 +500,9 @@ C[row * N + col] = value;
 
 这意味着你只替换了“内核实现”，而没有破坏 Python 调用方式。
 
-## 22. 测速脚本解读：`test_speed.py`
+## 22. 测速脚本解读：`04_matmul_shared_memory/test_speed.py`
 
-`test_speed.py` 目标是快速比较 Shared 版本与 `torch.matmul`：
+`04_matmul_shared_memory/test_speed.py` 目标是快速比较 Shared 版本与 `torch.matmul`：
 
 1. 构造 `4096x4096` 输入
 2. 预热一次自定义算子
@@ -558,7 +574,7 @@ C[row * N + col] = value;
 
 这样能同时满足 PyTorch ABI 与 WMMA kernel 的参数类型要求。
 
-## 26. 新增代码详解：`matmul_wmma_pt.cu`
+## 26. 新增代码详解：`05_matmul_wmma/matmul_wmma_pt.cu`
 
 ### 26.1 头文件与命名空间
 
@@ -631,7 +647,7 @@ reinterpret_cast<const half*>(B.data_ptr<at::Half>())
 - 线程组织仍较朴素（`16x16` block，资源利用未最优化）
 - 已具备进一步优化基础（warp mapping、多 warp/block、shared staging 等）
 
-## 27. 新增代码详解：`test_tensor_cores.py`
+## 27. 新增代码详解：`05_matmul_wmma/test_tensor_cores.py`
 
 脚本关键点：
 
@@ -657,7 +673,7 @@ reinterpret_cast<const half*>(B.data_ptr<at::Half>())
 
 这一步是从“shared memory 优化”走向“硬件专用计算单元优化”的关键跨越。
 
-## 29. FlashAttention 对比实验（`test_flash.py`）
+## 29. FlashAttention 对比实验（`06_flash_attention/test_flash.py`）
 
 ### 29.1 为什么需要对比
 
@@ -665,7 +681,7 @@ reinterpret_cast<const half*>(B.data_ptr<at::Half>())
 
 **FlashAttention**（及其在 PyTorch 中的融合实现）通过 **分块（tiling）、在 SRAM 上融合 softmax 与对 \(V\) 的加权、以及逆向传播时的重计算** 等策略，显著减少对全局显存（HBM）的往返次数，因此在长序列、大 head 数配置下往往比“先算满矩阵再 softmax”的朴素路径快得多。
 
-本仓库中的 `test_flash.py` 在同一组随机 \(Q,K,V\) 上，分别测量：
+本仓库中的 `06_flash_attention/test_flash.py` 在同一组随机 \(Q,K,V\) 上，分别测量：
 
 1. **标准路径**：手写 `matmul → softmax → matmul`（会产生完整 \(L\times L\) 中间结果）。
 2. **融合路径**：`torch.nn.functional.scaled_dot_product_attention`（在支持的 GPU + dtype + 形状下会走 **FlashAttention / Memory-Efficient** 等后端）。
@@ -733,7 +749,7 @@ torch.allclose(out_std, out_flash, atol=1e-2)
 
 ```bash
 conda activate jax_env   # 或你已配置好的、含 PyTorch 2.x + CUDA 的环境
-python test_flash.py
+python 06_flash_attention/test_flash.py
 ```
 
 依赖：`torch` 能使用 CUDA，且版本支持 `scaled_dot_product_attention`（建议 PyTorch 2.0+）。
@@ -748,11 +764,11 @@ python test_flash.py
 
 这一步的意义是：在 **不写 CUDA 内核** 的前提下，先建立对 **IO 感知注意力（FlashAttention 类思想）** 的直观认识，并与朴素三层算子链做 **可复现的数值与性能对照**，为后续阅读论文或自研内核打下基础。
 
-## 30. Triton FlashAttention 教学内核（`test_triton_flash.py`）
+## 30. Triton FlashAttention 教学内核（`07_triton_flash_attention/test_triton_flash.py`）
 
 ### 30.1 脚本目的与实测现象
 
-`test_triton_flash.py` 用 **Triton** 手写一个 **单头**、**二维布局** 的缩放点积注意力核（`Q,K,V` 形状均为 `(seq_len, d)`），与 PyTorch 的 **朴素三步**（`matmul → softmax → matmul`）在同一设备、同一输入上对比 **耗时** 与 **`torch.allclose`**。
+`07_triton_flash_attention/test_triton_flash.py` 用 **Triton** 手写一个 **单头**、**二维布局** 的缩放点积注意力核（`Q,K,V` 形状均为 `(seq_len, d)`），与 PyTorch 的 **朴素三步**（`matmul → softmax → matmul`）在同一设备、同一输入上对比 **耗时** 与 **`torch.allclose`**。
 
 一次典型终端输出（4090、`seq_len=4096`、`d=32`、FP16）：
 
@@ -788,9 +804,9 @@ python test_flash.py
 
 缩放因子脚本使用 **常量** `sqrt(32)`；若修改 `d`，需同步修改 kernel 中的除数（或改为传入 `scale` 指针/常量），否则数值会与 PyTorch 不一致。
 
-### 30.4 与 `test_flash.py` 的差异
+### 30.4 与 `06_flash_attention/test_flash.py` 的差异
 
-- **布局**：本脚本为 **单头、二维** `(L, d)`；`test_flash.py` 为 **多头四维** `(B, H, L, D)` 且对照 **PyTorch 融合 SDP**。
+- **布局**：本脚本为 **单头、二维** `(L, d)`；`06_flash_attention/test_flash.py` 为 **多头四维** `(B, H, L, D)` 且对照 **PyTorch 融合 SDP**。
 - **对照组**：本脚本对照的是 **手写三层朴素实现**；朴素路径中的两次 `matmul` 在 PyTorch 后端通常走 **cuBLAS**，对中等 \(L\) 与 FP16 高度成熟，**峰值算力很高**。
 - **目的**：本脚本侧重 **用 Triton 表达 Flash 类递推并验证正确性**；性能需单独做 **预热、多轮取均值、profiling** 再下结论。
 
@@ -809,10 +825,10 @@ python test_flash.py
 
 ```bash
 conda activate jax_env   # 需已安装 triton、torch CUDA 版
-python test_triton_flash.py
+python 07_triton_flash_attention/test_triton_flash.py
 ```
 
 ### 30.7 小结
 
 - 本文件展示：**用 Triton 描述 Flash 类 online softmax、块加载、`tl.dot` 计算 \(QK^\top\) 子块并与 \(V\) 融合累加** 的写法。
-- 与 PyTorch 朴素三步对比时，请 **先 warmup、再多轮测均值**，避免把 JIT 当成绩；并与 **融合 SDP**（`test_flash.py`）区分对照含义。
+- 与 PyTorch 朴素三步对比时，请 **先 warmup、再多轮测均值**，避免把 JIT 当成绩；并与 **融合 SDP**（`06_flash_attention/test_flash.py`）区分对照含义。
